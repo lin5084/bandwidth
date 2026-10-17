@@ -22,7 +22,7 @@ jobs:
           export NDK=${{ steps.setup_ndk.outputs.ndk-path }}
           export TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64
           export CC=$TOOLCHAIN/bin/armv7a-linux-androideabi21-clang
-          $CC -O3 -mfpu=neon -mfloat-abi=hard -pthread bandwidth.c -o bandwidth-armeabi
+          $CC -O3 -mfpu=neon -mfloat-abi=softfp -pthread bandwidth.c -o bandwidth-armeabi
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
