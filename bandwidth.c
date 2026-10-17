@@ -10,20 +10,35 @@ typedef struct {
     int type; //0 rd,1 wr,2 cp
 } ThreadArg;
 
-#define BLOCK (1024*1024)
+static unsigned int g_sum = 0;
+
 static void *worker(void *arg)
 {
     ThreadArg *t = (ThreadArg*)arg;
     size_t i;
     if(t->type == 0){
-        unsigned sum=0;
-        for(i=0;i<t->size;i++) sum += t->buf[i];
-        (void)sum;
+        // 读：volatile阻止优化，累加进全局原子变量
+        volatile unsigned char *p = (volatile unsigned char *)t->buf;
+        unsigned int sum = 0;
+        for(i=0;i<t->size;i++){
+            sum += p[i];
+        }
+        __sync_fetch_and_add(&g_sum, sum);
     }else if(t->type ==1){
-        for(i=0;i<t->size;i++) t->buf[i] = (char)(i&0xff);
+        //写
+        volatile unsigned char *p = (volatile unsigned char *)t->buf;
+        for(i=0;i<t->size;i++){
+            p[i] = (unsigned char)(i & 0xff);
+        }
     }else{
+        //拷贝
         char *dst = malloc(t->size);
-        for(i=0;i<t->size;i++) dst[i] = t->buf[i];
+        volatile unsigned char *src = (volatile unsigned char *)t->buf;
+        volatile unsigned char *d = (volatile unsigned char *)dst;
+        for(i=0;i<t->size;i++){
+            d[i] = src[i];
+        }
+        __sync_fetch_and_add(&g_sum, d[0]);
         free(dst);
     }
     return NULL;
