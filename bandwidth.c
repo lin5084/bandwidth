@@ -17,7 +17,7 @@ static void *worker(void *arg)
     ThreadArg *t = (ThreadArg*)arg;
     size_t i;
     if(t->type == 0){
-        // 读：volatile阻止优化，累加进全局原子变量
+        // rd 只读
         volatile unsigned char *p = (volatile unsigned char *)t->buf;
         unsigned int sum = 0;
         for(i=0;i<t->size;i++){
@@ -25,20 +25,16 @@ static void *worker(void *arg)
         }
         __sync_fetch_and_add(&g_sum, sum);
     }else if(t->type ==1){
-        //写
+        // wr 只写
         volatile unsigned char *p = (volatile unsigned char *)t->buf;
         for(i=0;i<t->size;i++){
             p[i] = (unsigned char)(i & 0xff);
         }
     }else{
-        //拷贝
+        // cp 拷贝，改用系统memcpy
         char *dst = malloc(t->size);
-        volatile unsigned char *src = (volatile unsigned char *)t->buf;
-        volatile unsigned char *d = (volatile unsigned char *)dst;
-        for(i=0;i<t->size;i++){
-            d[i] = src[i];
-        }
-        __sync_fetch_and_add(&g_sum, d[0]);
+        memcpy(dst, t->buf, t->size);
+        __sync_fetch_and_add(&g_sum, ((volatile unsigned char*)dst)[0]);
         free(dst);
     }
     return NULL;
@@ -46,9 +42,13 @@ static void *worker(void *arg)
 
 int main(int argc, char** argv)
 {
-    if(argc !=4){
-        printf("Usage: %s rd|wr|cp size_mb threads\n",argv[0]);
-        printf("Example: %s cp 64 4\n",argv[0]);
+    if(argc !=5){
+        printf("Usage: %s rd|wr|cp size_mb threads iterations\n",argv[0]);
+        printf("Example: %s cp 64 4 5\n",argv[0]);
+        printf("cp=copy, rd=read, wr=write\n");
+        printf("size_mb: total memory MB\n");
+        printf("threads: thread count\n");
+        printf("iterations: run N times and average\n");
         return 1;
     }
     int type;
@@ -59,6 +59,8 @@ int main(int argc, char** argv)
 
     size_t sz_mb = atoi(argv[2]);
     int th_cnt = atoi(argv[3]);
+    int iter = atoi(argv[4]);
+
     size_t per_thread = sz_mb*1024*1024 / th_cnt;
 
     pthread_t *ths = malloc(sizeof(pthread_t)*th_cnt);
@@ -70,20 +72,31 @@ int main(int argc, char** argv)
         args[t].type = type;
     }
 
-    struct timespec t0,t1;
-    clock_gettime(CLOCK_MONOTONIC,&t0);
-    for(int t=0;t<th_cnt;t++){
-        pthread_create(&ths[t],NULL,worker,&args[t]);
-    }
-    for(int t=0;t<th_cnt;t++){
-        pthread_join(ths[t],NULL);
-    }
-    clock_gettime(CLOCK_MONOTONIC,&t1);
+    double total_time = 0.0;
+    double total_bw_sum = 0.0;
 
-    double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec)/1e9;
-    double total_mb = (double)sz_mb;
-    double bw = total_mb / sec;
-    printf("Total %.2f MB, time %.3fs, Bandwidth: %.2f MB/s\n",total_mb,sec,bw);
+    printf("Run %d iterations, total %.2f MB per round, %d threads\n", iter, (double)sz_mb, th_cnt);
+    for(int round=0; round<iter; round++)
+    {
+        struct timespec t0,t1;
+        clock_gettime(CLOCK_MONOTONIC,&t0);
+        for(int t=0;t<th_cnt;t++){
+            pthread_create(&ths[t],NULL,worker,&args[t]);
+        }
+        for(int t=0;t<th_cnt;t++){
+            pthread_join(ths[t],NULL);
+        }
+        clock_gettime(CLOCK_MONOTONIC,&t1);
+
+        double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec)/1e9;
+        double bw = (double)sz_mb / sec;
+        printf("Round[%d] time %.3fs, Bandwidth: %.2f MB/s\n", round+1, sec, bw);
+        total_time += sec;
+        total_bw_sum += bw;
+    }
+
+    printf("===== Average =====\n");
+    printf("Avg time: %.3fs, Avg Bandwidth: %.2f MB/s\n", total_time/iter, total_bw_sum/iter);
 
     for(int t=0;t<th_cnt;t++) free(args[t].buf);
     free(ths);free(args);
