@@ -1,201 +1,104 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <errno.h>
+#include <pthread.h>
 #include <string.h>
+#include <time.h>
 
-#define BLK_SIZE 512
-static unsigned char wbuf[BLK_SIZE];
-static unsigned char rbuf[BLK_SIZE];
+typedef struct {
+    char *buf;
+    size_t size;
+    int type; //0 rd,1 wr,2 cp
+} ThreadArg;
 
-unsigned char patterns[4][BLK_SIZE];
+static unsigned int g_sum = 0;
 
-void init_pattern(void)
+static void *worker(void *arg)
 {
-    memset(patterns[0], 0x00, BLK_SIZE);
-    memset(patterns[1], 0xff, BLK_SIZE);
-    memset(patterns[2], 0x55, BLK_SIZE);
-    memset(patterns[3], 0xaa, BLK_SIZE);
-}
-
-// 自动读取块设备 /sys/block/xxx/size
-// devname: /dev/block/mmcblk0p1
-// out_size: 返回总扇区（512B）
-int get_block_device_size(const char *devname, unsigned long long *out_size)
-{
-    char sys_path[256];
-    char *p;
-    const char *basename;
-
-    // 提取 mmcblk0p1 从 /dev/block/mmcblk0p1
-    basename = strrchr(devname, '/');
-    if(basename == NULL){
-        basename = devname;
+    ThreadArg *t = (ThreadArg*)arg;
+    size_t i;
+    if(t->type == 0){
+        // rd 只读
+        volatile unsigned char *p = (volatile unsigned char *)t->buf;
+        unsigned int sum = 0;
+        for(i=0;i<t->size;i++){
+            sum += p[i];
+        }
+        __sync_fetch_and_add(&g_sum, sum);
+    }else if(t->type ==1){
+        // wr 只写
+        volatile unsigned char *p = (volatile unsigned char *)t->buf;
+        for(i=0;i<t->size;i++){
+            p[i] = (unsigned char)(i & 0xff);
+        }
     }else{
-        basename++;
+        // cp 拷贝，改用系统memcpy
+        char *dst = malloc(t->size);
+        memcpy(dst, t->buf, t->size);
+        __sync_fetch_and_add(&g_sum, ((volatile unsigned char*)dst)[0]);
+        free(dst);
     }
-    snprintf(sys_path, sizeof(sys_path), "/sys/block/%s/size", basename);
-
-    FILE *fp = fopen(sys_path, "r");
-    if(!fp){
-        printf("Failed to open %s\n", sys_path);
-        return -1;
-    }
-    if(fscanf(fp, "%llu", out_size) !=1){
-        fclose(fp);
-        return -1;
-    }
-    fclose(fp);
-    return 0;
-}
-
-// 只读扫描
-int read_test(int fd, unsigned long long start_blk, unsigned long long end_blk)
-{
-    unsigned long long blk;
-    int bad = 0;
-    off64_t offset;
-    unsigned long long total = end_blk - start_blk + 1;
-
-    for(blk = start_blk; blk <= end_blk; blk++)
-    {
-        offset = (off64_t)blk * BLK_SIZE;
-        if(lseek64(fd, offset, SEEK_SET) == -1)
-        {
-            printf("Warning: Seek fail block %llu, errno=%d (out of range)\n", blk, errno);
-            continue;
-        }
-        ssize_t ret = read(fd, rbuf, BLK_SIZE);
-        if(ret != BLK_SIZE)
-        {
-            printf("READ BAD BLOCK: %llu, ret=%zd errno=%d\n", blk, ret, errno);
-            bad++;
-        }
-        // 每5000个扇区打印一次进度
-        if ((blk - start_blk) % 5000 == 0)
-        {
-            printf("[Progress] Scanned %llu / %llu, found bad: %d\n", blk-start_blk, total, bad);
-            fflush(stdout);
-        }
-    }
-    return bad;
-}
-
-// 破坏性读写测试（-w模式，会清空数据！慎用）
-int write_test(int fd, unsigned long long start_blk, unsigned long long end_blk)
-{
-    unsigned long long blk;
-    unsigned int pat_idx;
-    int bad = 0;
-    off64_t offset;
-    int total_pat = 4;
-    unsigned long long total = end_blk - start_blk +1;
-
-    for(pat_idx = 0; pat_idx < total_pat; pat_idx++)
-    {
-        printf("=== Test pattern %d/4 ===\n", pat_idx+1);
-        for(blk = start_blk; blk <= end_blk; blk++)
-        {
-            offset = (off64_t)blk * BLK_SIZE;
-            if(lseek64(fd, offset, SEEK_SET) == -1)
-            {
-                printf("Warning: Seek fail block %llu, errno=%d (out of range)\n", blk, errno);
-                continue;
-            }
-            // write
-            if(write(fd, patterns[pat_idx], BLK_SIZE) != BLK_SIZE)
-            {
-                printf("WRITE BAD BLOCK: %llu\n", blk);
-                bad++;
-                continue;
-            }
-            fsync(fd);
-            // read back
-            lseek64(fd, offset, SEEK_SET);
-            if(read(fd, rbuf, BLK_SIZE) != BLK_SIZE)
-            {
-                printf("READBACK BAD BLOCK: %llu\n", blk);
-                bad++;
-                continue;
-            }
-            if(memcmp(rbuf, patterns[pat_idx], BLK_SIZE) != 0)
-            {
-                printf("DATA MISMATCH BAD BLOCK: %llu\n", blk);
-                bad++;
-            }
-            if ((blk - start_blk) % 5000 == 0)
-            {
-                printf("[Pattern%d Progress] Scanned %llu / %llu, bad: %d\n",pat_idx+1, blk-start_blk, total, bad);
-                fflush(stdout);
-            }
-        }
-    }
-    return bad;
+    return NULL;
 }
 
 int main(int argc, char** argv)
 {
-    if(argc !=3)
-    {
-        printf("Usage: %s dev_path start_block mode\n", argv[0]);
-        printf("mode: 0=read-only safe scan, 1=destructive write test(DATA LOSS!)\n");
-        printf("Example: %s /dev/block/mmcblk0p1 0 0\n", argv[0]);
-        printf("Auto read partition size, no need input end_block\n");
+    if(argc !=5){
+        printf("Usage: %s rd|wr|cp size_mb threads iterations\n",argv[0]);
+        printf("Example: %s cp 64 4 5\n",argv[0]);
+        printf("cp=copy, rd=read, wr=write\n");
+        printf("size_mb: total memory MB\n");
+        printf("threads: thread count\n");
+        printf("iterations: run N times and average\n");
         return 1;
     }
-    const char *dev = argv[1];
-    unsigned long long start = atoll(argv[2]);
-    int mode = atoi(argv[3]);
-    unsigned long long dev_sectors;
+    int type;
+    if(!strcmp(argv[1],"rd")) type=0;
+    else if(!strcmp(argv[1],"wr")) type=1;
+    else if(!strcmp(argv[1],"cp")) type=2;
+    else {printf("type must be rd wr cp\n");return 1;}
 
-    // 自动读取分区总扇区
-    if(get_block_device_size(dev, &dev_sectors) !=0)
-    {
-        printf("Get block size failed!\n");
-        return -1;
-    }
-    unsigned long long end = dev_sectors -1;
-    printf("Auto detect partition total sectors: %llu (512B/sector)\n", dev_sectors);
-    printf("Scan range: start=%llu , auto end=%llu\n", start, end);
+    size_t sz_mb = atoi(argv[2]);
+    int th_cnt = atoi(argv[3]);
+    int iter = atoi(argv[4]);
 
-    if(start > end)
-    {
-        printf("Error: start_block > end_block\n");
-        return -1;
+    size_t per_thread = sz_mb*1024*1024 / th_cnt;
+
+    pthread_t *ths = malloc(sizeof(pthread_t)*th_cnt);
+    ThreadArg *args = malloc(sizeof(ThreadArg)*th_cnt);
+
+    for(int t=0;t<th_cnt;t++){
+        args[t].buf = malloc(per_thread);
+        args[t].size = per_thread;
+        args[t].type = type;
     }
 
-    int fd = open(dev, O_RDONLY);
-    if(mode == 1)
-    {
-        fd = open(dev, O_RDWR);
-    }
-    if(fd < 0)
-    {
-        printf("Open %s failed, errno=%d, need root!\n", dev, errno);
-        return -1;
-    }
-    init_pattern();
-    int bad_blocks =0;
-    printf("badblocks start. dev:%s, mode=%s\n",
-           dev, (mode==1)?"Write-Destructive":"ReadOnly");
+    double total_time = 0.0;
+    double total_bw_sum = 0.0;
 
-    if(mode == 0)
+    printf("Run %d iterations, total %.2f MB per round, %d threads\n", iter, (double)sz_mb, th_cnt);
+    for(int round=0; round<iter; round++)
     {
-        bad_blocks = read_test(fd, start, end);
-    }else{
-        bad_blocks = write_test(fd, start, end);
+        struct timespec t0,t1;
+        clock_gettime(CLOCK_MONOTONIC,&t0);
+        for(int t=0;t<th_cnt;t++){
+            pthread_create(&ths[t],NULL,worker,&args[t]);
+        }
+        for(int t=0;t<th_cnt;t++){
+            pthread_join(ths[t],NULL);
+        }
+        clock_gettime(CLOCK_MONOTONIC,&t1);
+
+        double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec)/1e9;
+        double bw = (double)sz_mb / sec;
+        printf("Round[%d] time %.3fs, Bandwidth: %.2f MB/s\n", round+1, sec, bw);
+        total_time += sec;
+        total_bw_sum += bw;
     }
-    close(fd);
-    printf("\n==== SCAN FINISHED ====\n");
-    if(bad_blocks ==0)
-    {
-        printf("✅ NO BAD BLOCK found.\n");
-    }else{
-        printf("❌ TOTAL BAD BLOCKS: %d\n", bad_blocks);
-    }
+
+    printf("===== Average =====\n");
+    printf("Avg time: %.3fs, Avg Bandwidth: %.2f MB/s\n", total_time/iter, total_bw_sum/iter);
+
+    for(int t=0;t<th_cnt;t++) free(args[t].buf);
+    free(ths);free(args);
     return 0;
 }
